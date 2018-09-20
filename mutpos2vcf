@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+from pathlib import Path
+from typing import Dict
+
+import click
+import pyfaidx
+
+
+@click.command(context_settings=dict(help_option_names=['-h', '--help']))
+@click.option(
+    '-i',
+    '--mutpos_file',
+    required=True,
+    help='Path to .mutpos file (tab-delimited)',
+)
+@click.option(
+    '-s', '--sample', required=True, help='Sample name or identifier'
+)
+@click.option(
+    '-o', '--vcf_file', default=None, help='Path to output .vcf file'
+)
+@click.option(
+    '-r',
+    '--ref_file',
+    required=True,
+    help='Path to reference .fa file used to create the .mutpos',
+)
+@click.option(
+    '-d', '--dict_file', default=None, help='Path to reference .dict file'
+)
+@click.option(
+    '-m', '--min_depth', default=0, help='Minimum depth to flag a call [0]'
+)
+@click.option(
+    '-v', '--verbose', default=False, help='Whether to issue warnings'
+)
+def convert_mutpos_to_vcf(
+    mutpos_file: str,
+    sample: str,
+    vcf_file: str,
+    ref_file: str,
+    dict_file: str,
+    min_depth: int,
+    verbose: bool,
+) -> None:
+    """Script to convert Duplex Sequencing .mutpos file formats into valid VCF
+    files. Currently VCF format v4.2 is outputted. A .mutpos file is
+    tab-delimited and contains the following column fields:
+
+        \b
+        chromosome : chromosome/contig name or number (str)
+        reference  : the reference base (can be lowercase) (str)
+        position   : position in the reference genome (int)
+        depth      : depth of reads at this loci excluding No-calls (int)
+        total      : total depth of alternate alleles (int)
+        T          : depth of thymine alternate alleles at this loci (int)
+        C          : depth of cytosine alternate alleles at this loci (int)
+        G          : depth of guanine alternate alleles at this loci (int)
+        A          : depth of adenine alternate alleles at this loci (int)
+        insertions : depth of any insertions at this loci (int)
+        deletions  : depth of any deletions at this loci (int)
+        N          : depth of any No-calls at this loci (int)
+
+    Inconsistencies exist in this format depending on laboratory. Here is a
+    tally of known inconsistencies discovered insofar:
+
+        \b
+        1. Chromosome/contig names do not respective naming convention of
+               reference genome.
+        2. Order of bases is not consistent e.g. A, C, G, T vs. T, C, G, A.
+        3. Insertions and deletions are not qualified, only enumerated so these
+               cannot be ported to a VCF record.
+        4. Depth of reads at a given loci may or may not subtract No-calls.
+        5. Reference nucleotide can be uppercase or lowercase.
+        6. False REF == ALT calls can exist around called indel sites.
+        7. Reference base at given position does not match true genome.
+
+    """
+    header = 'CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{sample}\n'
+    reference = pyfaidx.Fasta(ref_file)
+
+    # .mutpos file does not define any filtering/quality metrics for the
+    # alternate allele calls so these should be set to a default value.
+    ID, QUAL = '.', '0'
+
+    if vcf_file is None:
+        vcf_file = Path(mutpos_file).with_suffix('.vcf')
+
+    with open(mutpos_file) as infile, open(vcf_file, 'w') as outfile:
+        outfile.write('##fileformat=VCFv4.2\n')
+        outfile.write(f'##reference={reference.filename}\n')
+        outfile.write(
+            f'##FILTER=<ID=DP{min_depth},Description="Non-N read depth below {min_depth}">\n'
+        )  # noqa
+        outfile.write(
+            '##INFO=<ID=DP,Number=1,Type=Integer,Description="Total non-N Depth">\n'
+        )  # noqa
+        outfile.write(
+            '##INFO=<ID=ND,Number=1,Type=Integer,Description="No-call Depth">\n'
+        )  # noqa
+        outfile.write(
+            '##INFO=<ID=VD,Number=1,Type=Integer,Description="Variant Depth">\n'
+        )  # noqa
+        outfile.write(
+            '##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allelic depths for the ref and alt alleles in the order listed">\n'
+        )  # noqa
+        outfile.write(
+            '##FORMAT=<ID=AF,Number=1,Type=Float,Description="Alternate Allele Frequency">\n'
+        )  # noqa
+        outfile.write(
+            '##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read Depth">\n'
+        )  # noqa
+        outfile.write(
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        )  # noqa
+        outfile.write(
+            '##FORMAT=<ID=ND,Number=1,Type=Integer,Description="No-call Depth">\n'
+        )  # noqa
+        outfile.write(
+            '##FORMAT=<ID=VD,Number=1,Type=Integer,Description="Variant Depth">\n'
+        )  # noqa
+        # outfile.write(f'##mutpos-to-vcfCommand=mutpos-to-vcf --mutpos_file {mutpos_file} --sample {sample} --vcf_file {vcf_file} --ref_file {ref_file} --min_depth {min_depth}\n')  # noqa
+
+        # Include the FASTA dictionary if it exists.
+        if dict_file is not None:
+            with open(dict_file) as handle:
+                for line in handle:
+                    if not line.startswith('@SQ'):
+                        continue
+
+                    sequence_dict: Dict = {}
+                    for field in line.strip().replace('@SQ\t', '').split('\t'):
+                        sequence_dict.update([field.split(':', maxsplit=1)])
+
+                    contig = sequence_dict.get('SN', 'None')
+                    length = sequence_dict.get('LN', '0')
+                    assembly = sequence_dict.get('AS', 'None')
+
+                    outfile.write(
+                        '##contig=<'
+                        f'ID={contig},'
+                        f'length={length},'
+                        f'assembly={assembly}>\n'
+                    )
+
+        outfile.write('#' + header.format(sample=sample))
+
+        for i, line in enumerate(infile):
+            if line.startswith('#') or line.strip() == '':
+                continue
+
+            ALT, AD = [], []
+            CHROM, REF, POS, *counts = line.strip().split('\t')
+            DP, total, T, C, G, A, insertion, deletion, N = map(int, counts)
+
+            # Checks to make sure .mutpos file is formed correctly and that
+            # contigs exist in reference if a reference is provided.
+            if total != sum((A, C, T, G)):
+                raise ValueError(
+                    f'Total field does not equal the sum of alternate alleles at line {i}.\n\n{line}'
+                )  # noqa
+            elif CHROM not in reference.keys():
+                raise KeyError(
+                    f'Contig "{CHROM}" not in reference at line {i}.\n\n{line}'
+                )  # noqa
+            else:
+                pass
+
+            # If there are no SNVs at this site, then continue.
+            if total == 0:
+                continue
+
+            # Grab all ALT alleles with non-zero counts that are not REF.
+            for ALT_base, count in zip(('A', 'C', 'G', 'T'), (A, C, G, T)):
+                if ALT_base != REF and count != 0:
+                    ALT.append(ALT_base)
+                    AD.append(count)
+
+            # There exists a bug in .mutpos creation scripts that may call an
+            # ALT allele the same as a REF allele if an indel is also present.
+            # Until that is fixed we need to double check we have ALT alleles.
+            if sum(AD) == 0:
+                continue
+
+            # ALT field contains bases not reference.
+            ALT = ','.join(ALT)
+
+            # Only FILTER flag worth having is one for min read depth (non-N).
+            FILTER = 'PASS' if DP >= min_depth else f'DP{min_depth}'
+
+            INFO = f'DP={DP};ND={N};VD={sum(AD)}'
+
+            # Calculate the depth of the reference allele by subtracting all
+            # alternate allele depths from the total non-N depth.
+            RD = DP - sum(AD)  # Depth of reference allele.
+
+            # Genotype is standard `0/1` to support coloring in igv.
+            FORMAT = 'GT:AD:AF:DP:ND:VD'
+            SMPL = (
+                '0/1:'
+                f'{",".join(map(str, [RD] + list(AD)))}:'
+                f'{sum(AD) / DP}:'
+                f'{DP}:'
+                f'{N}:'
+                f'{sum(AD)}'
+            )
+
+            line = [CHROM, POS, ID, REF, ALT, QUAL, FILTER, INFO, FORMAT, SMPL]
+
+            outfile.write('\t'.join(line) + '\n')
+
+
+if __name__ == '__main__':
+    convert_mutpos_to_vcf()
