@@ -11,7 +11,7 @@
 Script to convert Duplex Sequencing `.mutpos` file formats into valid VCF files.
 
 ```bash
-❯ pip install git+git@github.com:clintval/mutpos2vcf.git
+❯ pip install git+git://github.com/clintval/mutpos2vcf.git#egg=mutpos2vcf
 ```
 
 Features:
